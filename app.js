@@ -4,10 +4,10 @@ const { useState, useEffect, useCallback } = React;
 const MATERIALS = ['PLA','PETG','ABS','ASA','TPU','TPE','Nylon','PA6','PA12','PC','HIPS','PVA','BVOH','PET','PP','PEEK','PEI'];
 const COLORS = ['Black','White','Red','Blue','Green','Yellow','Orange','Purple','Pink','Grey','Gray','Silver','Gold','Transparent','Natural','Negro','Blanco','Rojo','Azul','Verde','Amarillo','Naranja','Morado','Rosa','Gris','Plateado','Dorado','Transparente','Natural'];
 
-function parseNFCData(rawText) {
-  if (!rawText || typeof rawText !== 'string') return createEmptyRecord();
+function parseNFCData(rawText, tagInfo='') {
+  if (!rawText || typeof rawText !== 'string') return createEmptyRecord(tagInfo);
   const text = rawText.trim();
-  const record = createEmptyRecord();
+  const record = createEmptyRecord(tagInfo);
   record.rawData = text;
 
   for (const mat of MATERIALS) {
@@ -32,8 +32,8 @@ function parseNFCData(rawText) {
   record.readDate = new Date().toLocaleString('es-ES');
   return record;
 }
-function createEmptyRecord() {
-  return { material:'', color:'', diameter:'', weight:'', brand:'', nozzleTemp:'', bedTemp:'', notes:'', rawData:'', readDate:'', tagInfo:'' };
+function createEmptyRecord(tagInfo='') {
+  return { material:'', color:'', diameter:'', weight:'', brand:'', nozzleTemp:'', bedTemp:'', notes:'', rawData:'', readDate:'', tagInfo };
 }
 const HEADERS = ['Fecha Lectura','Marca','Material','Color','Diámetro','Peso','Temp. Nozzle','Temp. Cama','Notas','Datos Crudos','Info Tag'];
 function recordToArray(r){ return [r.readDate,r.brand,r.material,r.color,r.diameter,r.weight,r.nozzleTemp,r.bedTemp,r.notes,r.rawData,r.tagInfo]; }
@@ -41,7 +41,6 @@ function recordToArray(r){ return [r.readDate,r.brand,r.material,r.color,r.diame
 function bufToHex(buffer) {
   return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2,'0')).join(' ').toUpperCase();
 }
-
 function tryDecodeText(buffer) {
   try { return new TextDecoder('utf-8').decode(buffer); } catch { return null; }
 }
@@ -71,14 +70,13 @@ function useStorage() {
 function useNFC() {
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState(null);
-  const [lastTagInfo, setLastTagInfo] = useState(null);
   const [supported] = useState('NDEFReader' in window);
   const ctrlRef = React.useRef(null);
 
   const startScan = useCallback(async (onRecord) => {
     if (!supported) { setError('NFC no soportado. Usa Chrome en Android con NFC activado.'); return; }
     try {
-      setError(null); setLastTagInfo(null); setScanning(true);
+      setError(null); setScanning(true);
       const ndef = new NDEFReader();
       ctrlRef.current = new AbortController();
       await ndef.scan({ signal: ctrlRef.current.signal });
@@ -110,31 +108,30 @@ function useNFC() {
         onRecord(txt.trim(), info);
       });
 
-      ndef.addEventListener('readingerror', e => {
-        const info = e.serialNumber ? `Serial detectado: ${e.serialNumber}` : 'Tag no legible';
-        setLastTagInfo(info);
-        setError('La etiqueta no contiene datos NDEF legibles. Posiblemente es MIFARE Classic o formato binario propietario. Usa "Entrada manual".');
+      ndef.addEventListener('readingerror', () => {
+        setError('Error leyendo etiqueta. El tag no contiene datos NDEF válidos. Es posible que use un formato binario propietario (común en Anycubic, Sunlu...). Prueba el "Modo pegar datos" con NFC Tools.');
       });
     } catch(err) { if(err.name!=='AbortError') setError(err.message||'Error al escanear'); setScanning(false); }
   }, [supported]);
 
   const stopScan = useCallback(() => { if(ctrlRef.current){ ctrlRef.current.abort(); ctrlRef.current=null; } setScanning(false); }, []);
-  return { scanning, error, supported, startScan, stopScan, lastTagInfo };
+  return { scanning, error, supported, startScan, stopScan };
 }
 
 /* ============ COMPONENTES ============ */
 function App() {
-  const { scanning, error, supported, startScan, stopScan, lastTagInfo } = useNFC();
+  const { scanning, error, supported, startScan, stopScan } = useNFC();
   const { records, addRecord, updateRecord, deleteRecord, clearAll } = useStorage();
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({});
   const [showRaw, setShowRaw] = useState({});
   const [showManual, setShowManual] = useState(false);
+  const [showPaste, setShowPaste] = useState(false);
   const [manualForm, setManualForm] = useState(createEmptyRecord());
+  const [pasteText, setPasteText] = useState('');
 
   const onRead = useCallback((txt, tagInfo) => {
-    const rec = parseNFCData(txt);
-    rec.tagInfo = tagInfo || '';
+    const rec = parseNFCData(txt, tagInfo);
     addRecord(rec);
     stopScan();
   }, [addRecord, stopScan]);
@@ -149,6 +146,14 @@ function App() {
     addRecord(rec);
     setManualForm(createEmptyRecord());
     setShowManual(false);
+  };
+
+  const savePaste = () => {
+    if (!pasteText.trim()) return;
+    const rec = parseNFCData(pasteText, 'Pegado manual desde NFC Tools');
+    addRecord(rec);
+    setPasteText('');
+    setShowPaste(false);
   };
 
   const manualInput = (label, field, placeholder='') => (
@@ -167,19 +172,17 @@ function App() {
 
       <div style={S.card}>
         {!supported && <div style={S.errBox}>⚠️ NFC no disponible. Usa <strong>Chrome en Android</strong> con NFC activado.</div>}
-        {error && (
-          <div style={S.errBox}>
-            ❌ {error}
-            {lastTagInfo && <div style={{marginTop:'6px',fontSize:'12px',opacity:0.8}}>{lastTagInfo}</div>}
-          </div>
-        )}
+        {error && <div style={S.errBox}>❌ {error}</div>}
         <button onClick={scanning?stopScan:()=>startScan(onRead)} disabled={!supported} style={{...S.btn, background: scanning?'#ef4444':'#0ea5e9', opacity: supported?1:0.5}}>
           {scanning?'⏹️ Detener escaneo':'📲 Escanear etiqueta NFC'}
         </button>
         {scanning && <div style={S.scanning}><div style={S.pulse}></div><p>Acerca el móvil a la etiqueta NFC...</p></div>}
 
-        <button onClick={()=>setShowManual(!showManual)} style={{...S.btn, background:'#475569', marginTop:'10px'}}>
+        <button onClick={()=>{setShowManual(!showManual);setShowPaste(false)}} style={{...S.btn, background:'#475569', marginTop:'10px'}}>
           ✏️ {showManual?'Ocultar entrada manual':'Añadir entrada manual'}
+        </button>
+        <button onClick={()=>{setShowPaste(!showPaste);setShowManual(false)}} style={{...S.btn, background:'#7c3aed', marginTop:'10px'}}>
+          📋 {showPaste?'Ocultar modo pegar datos':'Pegar datos NFC (NFC Tools)'}
         </button>
 
         {showManual && (
@@ -194,6 +197,15 @@ function App() {
             {manualInput('Temp. Cama','bedTemp','Ej: 60 °C')}
             {manualInput('Notas','notes','Cualquier dato extra')}
             <button onClick={saveManual} style={{...S.btn, background:'#10b981', marginTop:'10px'}}>💾 Guardar registro</button>
+          </div>
+        )}
+
+        {showPaste && (
+          <div style={{marginTop:'16px', padding:'16px', background:'#0f172a', borderRadius:'10px'}}>
+            <h3 style={{margin:'0 0 8px', color:'#94a3b8', fontSize:'14px'}}>Pega aquí los datos hexadecimales de NFC Tools:</h3>
+            <p style={{margin:'0 0 10px', fontSize:'12px', color:'#64748b'}}>Abre NFC Tools → "Other" → "Advanced NFC commands" → lee la etiqueta → copia el hex → pégalo aquí</p>
+            <textarea style={{...S.manualInp, width:'100%', minHeight:'80px', fontFamily:'monospace', fontSize:'12px'}} value={pasteText} onChange={e=>setPasteText(e.target.value)} placeholder="04 A5 2B..."/>
+            <button onClick={savePaste} style={{...S.btn, background:'#10b981', marginTop:'10px'}}>💾 Guardar datos pegados</button>
           </div>
         )}
       </div>
@@ -262,7 +274,7 @@ function App() {
       {records.length===0 && !scanning && (
         <div style={S.empty}>
           <p>📭 Aún no hay registros</p>
-          <p style={S.emptySub}>Pulsa "Escanear etiqueta NFC" o usa "Añadir entrada manual"</p>
+          <p style={S.emptySub}>Pulsa "Escanear etiqueta NFC", "Entrada manual" o "Pegar datos NFC"</p>
         </div>
       )}
     </div>
