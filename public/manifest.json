@@ -1,0 +1,13 @@
+{
+  "name": "NFC Filamento Reader",
+  "short_name": "NFC Filamento",
+  "description": "Lector NFC para etiquetas de filamento 3D",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0ea5e9",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "public/favicon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
