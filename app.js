@@ -33,10 +33,18 @@ function parseNFCData(rawText) {
   return record;
 }
 function createEmptyRecord() {
-  return { material:'', color:'', diameter:'', weight:'', brand:'', nozzleTemp:'', bedTemp:'', notes:'', rawData:'', readDate:'' };
+  return { material:'', color:'', diameter:'', weight:'', brand:'', nozzleTemp:'', bedTemp:'', notes:'', rawData:'', readDate:'', tagInfo:'' };
 }
-const HEADERS = ['Fecha Lectura','Marca','Material','Color','Diámetro','Peso','Temp. Nozzle','Temp. Cama','Notas','Datos Crudos'];
-function recordToArray(r){ return [r.readDate,r.brand,r.material,r.color,r.diameter,r.weight,r.nozzleTemp,r.bedTemp,r.notes,r.rawData]; }
+const HEADERS = ['Fecha Lectura','Marca','Material','Color','Diámetro','Peso','Temp. Nozzle','Temp. Cama','Notas','Datos Crudos','Info Tag'];
+function recordToArray(r){ return [r.readDate,r.brand,r.material,r.color,r.diameter,r.weight,r.nozzleTemp,r.bedTemp,r.notes,r.rawData,r.tagInfo]; }
+
+function bufToHex(buffer) {
+  return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2,'0')).join(' ').toUpperCase();
+}
+
+function tryDecodeText(buffer) {
+  try { return new TextDecoder('utf-8').decode(buffer); } catch { return null; }
+}
 
 /* ============ EXCEL ============ */
 function exportToExcel(records) {
@@ -63,47 +71,92 @@ function useStorage() {
 function useNFC() {
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState(null);
+  const [lastTagInfo, setLastTagInfo] = useState(null);
   const [supported] = useState('NDEFReader' in window);
   const ctrlRef = React.useRef(null);
 
   const startScan = useCallback(async (onRecord) => {
     if (!supported) { setError('NFC no soportado. Usa Chrome en Android con NFC activado.'); return; }
     try {
-      setError(null); setScanning(true);
+      setError(null); setLastTagInfo(null); setScanning(true);
       const ndef = new NDEFReader();
       ctrlRef.current = new AbortController();
       await ndef.scan({ signal: ctrlRef.current.signal });
+
       ndef.addEventListener('reading', e => {
         let txt='';
+        let hexParts=[];
+        let info = `Serial: ${e.serialNumber || 'N/A'}`;
         for (const rec of e.message.records) {
-          if (rec.recordType==='text') txt += new TextDecoder(rec.encoding||'utf-8').decode(rec.data)+' ';
-          else if (rec.recordType==='url') txt += new TextDecoder().decode(rec.data)+' ';
-          else txt += `[${rec.recordType}] `;
+          info += ` | Tipo: ${rec.recordType}`;
+          if (rec.recordType==='text') {
+            txt += new TextDecoder(rec.encoding||'utf-8').decode(rec.data)+' ';
+          } else if (rec.recordType==='url') {
+            txt += new TextDecoder().decode(rec.data)+' ';
+          } else if (rec.recordType==='mime') {
+            info += ` (${rec.mediaType})`;
+            const decoded = tryDecodeText(rec.data);
+            if (decoded) txt += decoded + ' ';
+            else hexParts.push(bufToHex(rec.data));
+          } else if (rec.recordType==='unknown') {
+            hexParts.push(bufToHex(rec.data));
+          } else {
+            const decoded = tryDecodeText(rec.data);
+            if (decoded) txt += decoded + ' ';
+            else hexParts.push(bufToHex(rec.data));
+          }
         }
-        onRecord(txt.trim());
+        if (hexParts.length && !txt.trim()) txt = hexParts.join(' | ');
+        onRecord(txt.trim(), info);
       });
-      ndef.addEventListener('readingerror', () => setError('Error leyendo etiqueta. Intenta de nuevo.'));
+
+      ndef.addEventListener('readingerror', e => {
+        const info = e.serialNumber ? `Serial detectado: ${e.serialNumber}` : 'Tag no legible';
+        setLastTagInfo(info);
+        setError('La etiqueta no contiene datos NDEF legibles. Posiblemente es MIFARE Classic o formato binario propietario. Usa "Entrada manual".');
+      });
     } catch(err) { if(err.name!=='AbortError') setError(err.message||'Error al escanear'); setScanning(false); }
   }, [supported]);
 
   const stopScan = useCallback(() => { if(ctrlRef.current){ ctrlRef.current.abort(); ctrlRef.current=null; } setScanning(false); }, []);
-  return { scanning, error, supported, startScan, stopScan };
+  return { scanning, error, supported, startScan, stopScan, lastTagInfo };
 }
 
 /* ============ COMPONENTES ============ */
 function App() {
-  const { scanning, error, supported, startScan, stopScan } = useNFC();
+  const { scanning, error, supported, startScan, stopScan, lastTagInfo } = useNFC();
   const { records, addRecord, updateRecord, deleteRecord, clearAll } = useStorage();
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({});
   const [showRaw, setShowRaw] = useState({});
+  const [showManual, setShowManual] = useState(false);
+  const [manualForm, setManualForm] = useState(createEmptyRecord());
 
-  const onRead = useCallback(txt => { addRecord(parseNFCData(txt)); stopScan(); }, [addRecord, stopScan]);
+  const onRead = useCallback((txt, tagInfo) => {
+    const rec = parseNFCData(txt);
+    rec.tagInfo = tagInfo || '';
+    addRecord(rec);
+    stopScan();
+  }, [addRecord, stopScan]);
 
   const beginEdit = i => { setEditing(i); setForm({...records[i]}); };
   const saveEdit = () => { if(editing!==null){ updateRecord(editing, form); setEditing(null); } };
   const cancelEdit = () => setEditing(null);
   const toggleRaw = i => setShowRaw(p=>({...p,[i]:!p[i]}));
+
+  const saveManual = () => {
+    const rec = { ...manualForm, readDate: new Date().toLocaleString('es-ES') };
+    addRecord(rec);
+    setManualForm(createEmptyRecord());
+    setShowManual(false);
+  };
+
+  const manualInput = (label, field, placeholder='') => (
+    <div style={S.fieldRow}>
+      <label style={S.label}>{label}</label>
+      <input style={S.manualInp} placeholder={placeholder} value={manualForm[field]} onChange={e=>setManualForm({...manualForm,[field]:e.target.value})}/>
+    </div>
+  );
 
   return (
     <div style={S.container}>
@@ -114,11 +167,35 @@ function App() {
 
       <div style={S.card}>
         {!supported && <div style={S.errBox}>⚠️ NFC no disponible. Usa <strong>Chrome en Android</strong> con NFC activado.</div>}
-        {error && <div style={S.errBox}>❌ {error}</div>}
+        {error && (
+          <div style={S.errBox}>
+            ❌ {error}
+            {lastTagInfo && <div style={{marginTop:'6px',fontSize:'12px',opacity:0.8}}>{lastTagInfo}</div>}
+          </div>
+        )}
         <button onClick={scanning?stopScan:()=>startScan(onRead)} disabled={!supported} style={{...S.btn, background: scanning?'#ef4444':'#0ea5e9', opacity: supported?1:0.5}}>
           {scanning?'⏹️ Detener escaneo':'📲 Escanear etiqueta NFC'}
         </button>
         {scanning && <div style={S.scanning}><div style={S.pulse}></div><p>Acerca el móvil a la etiqueta NFC...</p></div>}
+
+        <button onClick={()=>setShowManual(!showManual)} style={{...S.btn, background:'#475569', marginTop:'10px'}}>
+          ✏️ {showManual?'Ocultar entrada manual':'Añadir entrada manual'}
+        </button>
+
+        {showManual && (
+          <div style={{marginTop:'16px', padding:'16px', background:'#0f172a', borderRadius:'10px'}}>
+            <h3 style={{margin:'0 0 12px', color:'#94a3b8', fontSize:'14px'}}>Introduce los datos del filamento:</h3>
+            {manualInput('Marca','brand','Ej: Anycubic')}
+            {manualInput('Material','material','Ej: PLA')}
+            {manualInput('Color','color','Ej: Rojo')}
+            {manualInput('Diámetro','diameter','Ej: 1.75 mm')}
+            {manualInput('Peso','weight','Ej: 1 kg')}
+            {manualInput('Temp. Nozzle','nozzleTemp','Ej: 200 °C')}
+            {manualInput('Temp. Cama','bedTemp','Ej: 60 °C')}
+            {manualInput('Notas','notes','Cualquier dato extra')}
+            <button onClick={saveManual} style={{...S.btn, background:'#10b981', marginTop:'10px'}}>💾 Guardar registro</button>
+          </div>
+        )}
       </div>
 
       {records.length>0 && (
@@ -161,13 +238,17 @@ function App() {
                         <td style={S.td}>
                           <button style={S.icon} onClick={()=>beginEdit(i)}>✏️</button>
                           <button style={S.icon} onClick={()=>deleteRecord(i)}>🗑️</button>
-                          {r.rawData && <button style={S.icon} onClick={()=>toggleRaw(i)}>{showRaw[i]?'🔼':'🔽'}</button>}
+                          {(r.rawData || r.tagInfo) && <button style={S.icon} onClick={()=>toggleRaw(i)}>{showRaw[i]?'🔼':'🔽'}</button>}
                         </td>
                       </>)}
                     </tr>
                     {showRaw[i] && (
                       <tr><td colSpan={9} style={S.rawCell}>
-                        <div style={S.rawBox}><strong>Datos crudos:</strong><pre style={S.pre}>{r.rawData}</pre></div>
+                        <div style={S.rawBox}>
+                          {r.tagInfo && <div><strong>Info Tag:</strong> {r.tagInfo}</div>}
+                          <div><strong>Datos crudos:</strong></div>
+                          <pre style={S.pre}>{r.rawData || '(sin datos)'}</pre>
+                        </div>
                       </td></tr>
                     )}
                   </React.Fragment>
@@ -181,7 +262,7 @@ function App() {
       {records.length===0 && !scanning && (
         <div style={S.empty}>
           <p>📭 Aún no hay registros</p>
-          <p style={S.emptySub}>Pulsa "Escanear etiqueta NFC" y acerca tu móvil a una etiqueta de filamento</p>
+          <p style={S.emptySub}>Pulsa "Escanear etiqueta NFC" o usa "Añadir entrada manual"</p>
         </div>
       )}
     </div>
@@ -211,6 +292,9 @@ const S = {
   tr: { borderBottom:'1px solid #334155' },
   td: { padding:'8px', color:'#e2e8f0', verticalAlign:'middle' },
   inp: { width:'80px', padding:'4px 6px', borderRadius:'4px', border:'1px solid #475569', background:'#0f172a', color:'#e2e8f0', fontSize:'12px' },
+  manualInp: { flex:1, padding:'8px 10px', borderRadius:'6px', border:'1px solid #475569', background:'#1e293b', color:'#e2e8f0', fontSize:'14px' },
+  fieldRow: { display:'flex', alignItems:'center', gap:'10px', marginBottom:'8px' },
+  label: { width:'110px', fontSize:'13px', color:'#94a3b8', fontWeight:500 },
   icon: { background:'none', border:'none', cursor:'pointer', fontSize:'16px', padding:'2px 4px', opacity:0.8 },
   rawCell: { padding:'0 8px 8px' },
   rawBox: { padding:'10px', background:'#0f172a', borderRadius:'6px', fontSize:'12px', color:'#94a3b8', wordBreak:'break-all' },
